@@ -3,11 +3,12 @@ import argparse
 import numpy as np
 import pandas as pd
 import torch
-import wandb
 from datasets import load_dataset
 from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
 from tqdm import tqdm
 from transformers import AutoTokenizer, AutoModelForSequenceClassification, AdamW, get_linear_schedule_with_warmup
+
+import wandb
 
 # Define model names
 MODEL_NAMES = ['bert-base-uncased', 'roberta-base', 'google/electra-base-generator']
@@ -164,7 +165,6 @@ def predict(model, test_loader, device, output_path):
 
 
 def select_best_model(results_df: pd.DataFrame):
-    # select the best model (The model with the best mean, and if there are multiple models with the same mean, select the one with the best accuracy)
     # get all the rows with the best mean and select the one with the best accuracy
     best_model = results_df.loc[results_df['mean'] == results_df['mean'].max()]
     best_model = best_model.loc[best_model['accuracy'] == best_model['accuracy'].max()]
@@ -196,9 +196,9 @@ def main():
     parser = argparse.ArgumentParser(description='Fine-tune large language models for sentiment analysis')
     parser.add_argument('--num_seeds', type=int, help='number of seeds to use for each model', default=1)
     parser.add_argument('--train_samples', type=int, help='number of samples to use for training or -1 for all',
-                        default=1)
+                        default=-1)
     parser.add_argument('--val_samples', type=int, help='number of samples to use for validation or -1 for all',
-                        default=1)
+                        default=-1)
     parser.add_argument('--test_samples', type=int, help='number of samples to predict or -1 for all',
                         default=-1)
     parser.add_argument('--batch_size', type=int, default=16, help='batch size to use for training')
