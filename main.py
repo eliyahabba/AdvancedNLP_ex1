@@ -3,12 +3,11 @@ import argparse
 import numpy as np
 import pandas as pd
 import torch
+import wandb
 from datasets import load_dataset
 from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
 from tqdm import tqdm
 from transformers import AutoTokenizer, AutoModelForSequenceClassification, AdamW, get_linear_schedule_with_warmup
-
-import wandb
 
 # Define model names
 MODEL_NAMES = ['bert-base-uncased', 'roberta-base', 'google/electra-base-generator']
@@ -79,7 +78,7 @@ def fine_tune_model(model_name, train_dataset, val_dataset, seed, device, batch_
             # Log metrics to Weights&Biases
             wandb.log({'train/loss': loss.item(), 'epoch': epoch, 'seed': seed})
             wandb.log({'train/learning_rate': lr_scheduler.get_last_lr()[0], 'epoch': epoch, 'seed': seed})
-
+            wandb.log({'train/batch_size': batch_size, 'epoch': epoch, 'seed': seed})
 
         # Evaluate model
         val_accuracy = evaluate_model(model, val_dataloader, epoch, seed, device)
@@ -94,19 +93,22 @@ def evaluate_model(model, val_dataloader, epoch, seed, device):
     val_accuracy = 0
     val_loss = 0
     for batch in val_dataloader:
-        inputs = {k: v.to(device) for k, v in batch.items()}
-        outputs = model(**inputs)
-        logits = outputs.logits
-        val_loss += outputs.loss
-        predictions = torch.argmax(logits, dim=-1)
-        val_accuracy += np.sum(predictions.numpy() == batch['labels'].numpy()) / len(batch['labels'].numpy())
+        with torch.no_grad():
+            inputs = {k: v.to(device) for k, v in batch.items()}
+            outputs = model(**inputs)
+            logits = outputs.logits
+            val_loss += outputs.loss
+            predictions = torch.argmax(logits, dim=-1)
+            val_accuracy += np.sum(predictions.cpu().numpy() == batch['labels'].cpu().numpy()) / len(
+                batch['labels'].cpu().numpy())
     val_accuracy /= len(val_dataloader)
     # Log metrics to Weights&Biases
     wandb.log({'eval/accuracy': val_accuracy, 'epoch': epoch, 'seed': seed})
     wandb.log({'eval/loss': val_loss, 'epoch': epoch, 'seed': seed})
     return val_accuracy
 
-def summarize_results(results_df):
+
+def summarize_results(results_df) -> pd.DataFrame:
     """
     Computes the mean and standard deviation of the model accuracies and formats them for saving to the res.txt file.
 
@@ -118,18 +120,15 @@ def summarize_results(results_df):
     """
     results = "RESULTS:\n"
     # Compute mean and standard deviation of each model's accuracy (across all seeds)
-    model_scores = []
-    for model in results_df['model_name'].unique():
-        model_scores.append({'model_name': model,
-                             'accuracy': results_df[results_df['model_name'] == model]['accuracy'].mean(),
-                             'std': results_df[results_df['model_name'] == model]['accuracy'].std()})
+    results_df['mean'] = results_df.groupby('model_name')['accuracy'].transform('mean')
+    results_df['std'] = results_df.groupby('model_name')['accuracy'].transform('std')
+
+    # Add mean and standard deviation to results df
     # Format results
-    for model in model_scores:
-        print (f"{model['model_name']}: {model['accuracy']:.3f} ± {model['std']:.3f}\n")
-    model_scores_df = pd.DataFrame(model_scores)
-    return model_scores_df
-
-
+    for model in results_df.to_dict('records'):
+        print(f"{model['model_name']}: {model['accuracy']:.3f} ± {model['std']:.3f}\n")
+        results += f"{model['model_name']}: {model['accuracy']:.3f}\n"
+    return results_df
 
 
 def predict(model, test_loader, device, output_path):
@@ -164,18 +163,12 @@ def predict(model, test_loader, device, output_path):
             f.write(f"{pred}\n")
 
 
-def select_best_model(results):
-    best_model = None
-    best_acc = 0
-    for model_result in results:
-        model_name = model_result['model_name']
-        accs = results[model_name]['accuracy']
-        mean_acc = np.mean(accs)
-        if mean_acc > best_acc:
-            best_model = model_name
-            best_acc = mean_acc
-    best_seed = np.argmax(results[best_model]['accuracy'])
-    return best_model, best_seed
+def select_best_model(results_df: pd.DataFrame):
+    # select the best model (The model with the best mean, and if there are multiple models with the same mean, select the one with the best accuracy)
+    # get all the rows with the best mean and select the one with the best accuracy
+    best_model = results_df.loc[results_df['mean'] == results_df['mean'].max()]
+    best_model = best_model.loc[best_model['accuracy'] == best_model['accuracy'].max()]
+    return best_model
 
 
 def save_results(summary_results, predictions):
@@ -203,9 +196,9 @@ def main():
     parser = argparse.ArgumentParser(description='Fine-tune large language models for sentiment analysis')
     parser.add_argument('--num_seeds', type=int, help='number of seeds to use for each model', default=1)
     parser.add_argument('--train_samples', type=int, help='number of samples to use for training or -1 for all',
-                        default=-1)
+                        default=1)
     parser.add_argument('--val_samples', type=int, help='number of samples to use for validation or -1 for all',
-                        default=-1)
+                        default=1)
     parser.add_argument('--test_samples', type=int, help='number of samples to predict or -1 for all',
                         default=-1)
     parser.add_argument('--batch_size', type=int, default=16, help='batch size to use for training')
@@ -214,7 +207,7 @@ def main():
 
     # Set up Weights & Biases
     # Set up Weights&Biases logging
-    wandb.login()
+    # wandb.login()
     # Load SST-2 dataset
     train_dataset, val_dataset, test_dataset = get_data(args.train_samples, args.val_samples, args.test_samples)
 
@@ -230,9 +223,12 @@ def main():
                                                                                                model_name)
 
         for seed in seeds:
-            run_name = f"{model_name}-seed-{seed}"
-            wandb.init(project='sentiment_analysis', entity='eliyahabba', name=run_name)
-            val_accuracy_result = fine_tune_model(model_name, tokenized_train_dataset, tokenized_val_dataset, seed, device, args.batch_size)
+            run_name = f"{model_name}-seed-{seed}--batch_size-{args.batch_size}"
+            wandb.init(project='sentiment_analysis', entity='eliyahabba',
+                       name=run_name, config={'model_name': model_name, 'seed': seed, 'batch_size': args.batch_size},
+                       reinit=True)
+            val_accuracy_result = fine_tune_model(model_name, tokenized_train_dataset, tokenized_val_dataset, seed,
+                                                  device, args.batch_size)
             result = {'model_name': model_name, 'seed': seed, 'accuracy': val_accuracy_result}
             results.append(result)
     results_df = pd.DataFrame(results)
@@ -240,7 +236,7 @@ def main():
     summary_results = summarize_results(results_df)
 
     # Select best model
-    best_model_name, best_seed = select_best_model(summary_results)
+    best_model = select_best_model(summary_results)
 
     # Predict on test set with best model
     # _ = fine_tune_model(best_model_name, train_dataset, val_dataset, best_seed)
