@@ -3,15 +3,17 @@ import argparse
 import numpy as np
 import pandas as pd
 import torch
+import wandb
 from datasets import load_dataset
 from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
 from tqdm import tqdm
-from transformers import AutoTokenizer, AutoModelForSequenceClassification, AdamW, get_linear_schedule_with_warmup
-
-import wandb
+from transformers import AutoTokenizer, AutoModelForSequenceClassification, AdamW
 
 # Define model names
 MODEL_NAMES = ['bert-base-uncased', 'roberta-base', 'google/electra-base-generator']
+MODEL_NAMES = ['google/electra-base-generator']
+DEFAULT_BATCH_SIZE = 32
+DEFAULT_NUM_EPOCHS = 5
 
 
 def get_data(train_samples, val_samples, test_samples):
@@ -40,19 +42,21 @@ def tokenize_function(examples, tokenizer):
     return tokenizer(examples["sentence"], truncation=True, padding="max_length")
 
 
-def fine_tune_model(model_name, train_dataset, val_dataset, seed, device, batch_size=32):
+def fine_tune_model(model_name, train_dataset, val_dataset, seed, device, num_epochs=DEFAULT_NUM_EPOCHS,
+                    batch_size=DEFAULT_BATCH_SIZE):
     # Set random seed
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     # Set up tokenizer and model
     model = AutoModelForSequenceClassification.from_pretrained(model_name, num_labels=2).to(device)
+    model.train()
 
     # Set up optimizer and scheduler
     optimizer = AdamW(model.parameters())
-    num_epochs = 3
+
     num_training_steps = len(train_dataset) // (batch_size * num_epochs)
-    lr_scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=0, num_training_steps=num_training_steps)
+    # lr_scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=0, num_training_steps=num_training_steps)
 
     # Set up data loaders
     train_sampler = RandomSampler(train_dataset)
@@ -64,7 +68,6 @@ def fine_tune_model(model_name, train_dataset, val_dataset, seed, device, batch_
     # Train model
     # loop = tqdm(zip(val_loader, val_qas_ids_loader), leave=True)
     for epoch in tqdm(range(num_epochs)):
-        model.train()
         for batch in tqdm(train_dataloader):
             # move to device
             inputs = {k: v.to(device) for k, v in batch.items()}
@@ -75,10 +78,10 @@ def fine_tune_model(model_name, train_dataset, val_dataset, seed, device, batch_
             loss = outputs.loss
             loss.backward()
             optimizer.step()
-            lr_scheduler.step()
+            # lr_scheduler.step()
             # Log metrics to Weights&Biases
             wandb.log({'train/loss': loss.item(), 'epoch': epoch, 'seed': seed})
-            wandb.log({'train/learning_rate': lr_scheduler.get_last_lr()[0], 'epoch': epoch, 'seed': seed})
+            # wandb.log({'train/learning_rate': lr_scheduler.get_last_lr()[0], 'epoch': epoch, 'seed': seed})
             wandb.log({'train/batch_size': batch_size, 'epoch': epoch, 'seed': seed})
 
         # Evaluate model
@@ -100,9 +103,11 @@ def evaluate_model(model, val_dataloader, epoch, seed, device):
             logits = outputs.logits
             val_loss += outputs.loss
             predictions = torch.argmax(logits, dim=-1)
-            val_accuracy += np.sum(predictions.cpu().numpy() == batch['labels'].cpu().numpy()) / len(
-                batch['labels'].cpu().numpy())
-    val_accuracy /= len(val_dataloader)
+            val_accuracy += np.sum(predictions.cpu().numpy() == batch['labels'].cpu().numpy())
+
+    val_accuracy /= len(val_dataloader.dataset)  # divide by number of samples
+    val_accuracy *= 100  # convert to percentage
+
     # Log metrics to Weights&Biases
     wandb.log({'eval/accuracy': val_accuracy, 'epoch': epoch, 'seed': seed})
     wandb.log({'eval/loss': val_loss, 'epoch': epoch, 'seed': seed})
@@ -165,6 +170,7 @@ def predict(model, test_loader, device, output_path):
 
 
 def select_best_model(results_df: pd.DataFrame):
+    # select the best model (The model with the best mean, and if there are multiple models with the same mean, select the one with the best accuracy)
     # get all the rows with the best mean and select the one with the best accuracy
     best_model = results_df.loc[results_df['mean'] == results_df['mean'].max()]
     best_model = best_model.loc[best_model['accuracy'] == best_model['accuracy'].max()]
@@ -194,14 +200,15 @@ def tokenize_data(train_dataset, val_dataset, test_dataset, model_name):
 def main():
     # Parse command line arguments
     parser = argparse.ArgumentParser(description='Fine-tune large language models for sentiment analysis')
-    parser.add_argument('--num_seeds', type=int, help='number of seeds to use for each model', default=1)
+    parser.add_argument('--num_seeds', type=int, help='number of seeds to use for each model', default=30)
     parser.add_argument('--train_samples', type=int, help='number of samples to use for training or -1 for all',
-                        default=-1)
+                        default=12)
     parser.add_argument('--val_samples', type=int, help='number of samples to use for validation or -1 for all',
-                        default=-1)
+                        default=12)
     parser.add_argument('--test_samples', type=int, help='number of samples to predict or -1 for all',
                         default=-1)
-    parser.add_argument('--batch_size', type=int, default=16, help='batch size to use for training')
+    parser.add_argument('--batch_size', type=int, default=DEFAULT_BATCH_SIZE, help='batch size to use for training')
+    parser.add_argument('--epochs', type=int, default=DEFAULT_NUM_EPOCHS, help='number of epochs to train each model')
     args = parser.parse_args()
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -223,12 +230,16 @@ def main():
                                                                                                model_name)
 
         for seed in seeds:
-            run_name = f"{model_name}-seed-{seed}--batch_size-{args.batch_size}"
+            run_name = f"{model_name}-seed-{seed}--batch_size-{args.batch_size}--wo-ls"
             wandb.init(project='sentiment_analysis', entity='eliyahabba',
                        name=run_name, config={'model_name': model_name, 'seed': seed, 'batch_size': args.batch_size},
                        reinit=True)
-            val_accuracy_result = fine_tune_model(model_name, tokenized_train_dataset, tokenized_val_dataset, seed,
-                                                  device, args.batch_size)
+
+            val_accuracy_result = fine_tune_model(model_name=model_name,
+                                                  train_dataset=tokenized_train_dataset,
+                                                  val_dataset=tokenized_val_dataset,
+                                                  seed=seed, device=device, num_epochs=args.num_epochs,
+                                                  batch_size=args.batch_size)
             result = {'model_name': model_name, 'seed': seed, 'accuracy': val_accuracy_result}
             results.append(result)
     results_df = pd.DataFrame(results)
