@@ -11,7 +11,6 @@ from transformers import AutoTokenizer, AutoModelForSequenceClassification, Adam
 
 # Define model names
 MODEL_NAMES = ['bert-base-uncased', 'roberta-base', 'google/electra-base-generator']
-MODEL_NAMES = ['google/electra-base-generator']
 DEFAULT_BATCH_SIZE = 32
 DEFAULT_NUM_EPOCHS = 5
 
@@ -238,7 +237,7 @@ def main():
             val_accuracy_result = fine_tune_model(model_name=model_name,
                                                   train_dataset=tokenized_train_dataset,
                                                   val_dataset=tokenized_val_dataset,
-                                                  seed=seed, device=device, num_epochs=args.num_epochs,
+                                                  seed=seed, device=device, num_epochs=args.epochs,
                                                   batch_size=args.batch_size)
             result = {'model_name': model_name, 'seed': seed, 'accuracy': val_accuracy_result}
             results.append(result)
