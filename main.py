@@ -270,7 +270,7 @@ if __name__ == '__main__':
                         default=-1)
     parser.add_argument('test_samples', type=int, help='number of samples to predict or -1 for all',
                         default=-1)
-    parser.add_argument('batch_size', type=int, default=DEFAULT_BATCH_SIZE, help='batch size to use for training')
-    parser.add_argument('epochs', type=int, default=DEFAULT_NUM_EPOCHS, help='number of epochs to train each model')
+    parser.add_argument('--batch_size', type=int, default=DEFAULT_BATCH_SIZE, help='batch size to use for training')
+    parser.add_argument('--epochs', type=int, default=DEFAULT_NUM_EPOCHS, help='number of epochs to train each model')
     args = parser.parse_args()
     main(args)
