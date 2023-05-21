@@ -202,11 +202,15 @@ def tokenize_test_dataset(test_dataset, model_name):
 
 
 def train_model(model_name, tokenized_train_dataset, tokenized_val_dataset, seed, num_epochs=DEFAULT_NUM_EPOCHS,
-                batch_size=DEFAULT_BATCH_SIZE):
+                batch_size=DEFAULT_BATCH_SIZE, use_wandb=False):
     run_name = f"{model_name}-seed-{seed}--batch_size-{batch_size}"
-    wandb.init(project='sentiment_analysis', entity='eliyahabba',
-               name=run_name, config={'model_name': model_name, 'seed': seed, 'batch_size': batch_size},
-               reinit=True)
+    if use_wandb:
+        wandb.init(project='sentiment_analysis', entity='eliyahabba',
+                   name=run_name, config={'model_name': model_name, 'seed': seed, 'batch_size': batch_size},
+                   reinit=True)
+    else:
+        if not args.use_wandb:
+            wandb.init(mode="disabled")
 
     trainer, val_accuracy_result = fine_tune_model(model_name=model_name,
                                                    train_dataset=tokenized_train_dataset,
@@ -215,7 +219,8 @@ def train_model(model_name, tokenized_train_dataset, tokenized_val_dataset, seed
                                                    batch_size=batch_size)
     result = {'model_name': model_name, 'seed': seed, 'accuracy': val_accuracy_result['eval_accuracy'],
               'trainer': trainer}
-    wandb.finish()
+    if use_wandb:
+        wandb.finish()
     # # save the model
     # trainer.save_model(f"{run_name}")
     # # torch.save(trainer.state, f"trainer_state_{run_name}-model.pt")  # Save the Trainer's state
@@ -223,7 +228,7 @@ def train_model(model_name, tokenized_train_dataset, tokenized_val_dataset, seed
 
 
 def train_model_on_many_seeds(model_name, train_dataset, val_dataset, seeds, num_epochs=DEFAULT_NUM_EPOCHS,
-                              batch_size=DEFAULT_BATCH_SIZE):
+                              batch_size=DEFAULT_BATCH_SIZE, use_wandb=False):
     tokenized_train_dataset, tokenized_val_dataset = tokenize_data(train_dataset, val_dataset, model_name)
     model_results = []
     for seed in seeds:
@@ -244,7 +249,7 @@ def main(args):
     for model_name in MODEL_NAMES:
         # load the tokenizer and tokenize the data
         results.extend(train_model_on_many_seeds(model_name, train_dataset, val_dataset, seeds, args.epochs,
-                                                 args.batch_size))
+                                                 args.batch_size, args.use_wandb))
     end_train_time = time.time()
     # Select best model
     best_model_metadata, best_model_trainer = select_best_model(results, args.batch_size)
@@ -272,5 +277,6 @@ if __name__ == '__main__':
                         default=-1)
     parser.add_argument('--batch_size', type=int, default=DEFAULT_BATCH_SIZE, help='batch size to use for training')
     parser.add_argument('--epochs', type=int, default=DEFAULT_NUM_EPOCHS, help='number of epochs to train each model')
+    parser.add_argument('--use_wandb', action='store_true', help='whether to use wandb for logging', default=False)
     args = parser.parse_args()
     main(args)
