@@ -1,18 +1,23 @@
 import argparse
+import time
+from typing import List, Tuple
 
 import numpy as np
 import pandas as pd
-import torch
-import wandb
+import transformers
 from datasets import load_dataset
-from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
-from tqdm import tqdm
-from transformers import AutoTokenizer, AutoModelForSequenceClassification, AdamW
+from datasets import load_metric
+from transformers import AutoTokenizer, AutoModelForSequenceClassification, Trainer
+from transformers import TrainingArguments
+
+import wandb
 
 # Define model names
 MODEL_NAMES = ['bert-base-uncased', 'roberta-base', 'google/electra-base-generator']
-DEFAULT_BATCH_SIZE = 32
-DEFAULT_NUM_EPOCHS = 5
+
+# use the default batch size and number of epochs from transformers training arguments
+DEFAULT_BATCH_SIZE = int(TrainingArguments.per_device_train_batch_size)
+DEFAULT_NUM_EPOCHS = int(TrainingArguments.num_train_epochs)
 
 
 def get_data(train_samples, val_samples, test_samples):
@@ -26,94 +31,47 @@ def get_data(train_samples, val_samples, test_samples):
         val_dataset = val_dataset.select(range(val_samples))
     if test_samples != -1:
         test_dataset = test_dataset.select(range(test_samples))
-    train_dataset = train_dataset.map(lambda examples: {'labels': examples['label']}, batched=True)
-    val_dataset = val_dataset.map(lambda examples: {'labels': examples['label']}, batched=True)
-    test_dataset = test_dataset.map(lambda examples: {'labels': examples['label']}, batched=True)
-    val_dataset = val_dataset.remove_columns(['label'])
-    test_dataset = test_dataset.remove_columns(['label'])
-    train_dataset = train_dataset.remove_columns(['label'])
+    train_dataset = train_dataset.rename_column('label', 'labels')
+    val_dataset = val_dataset.rename_column('label', 'labels')
+    test_dataset = test_dataset.rename_column('label', 'labels')
 
     return train_dataset, val_dataset, test_dataset
 
 
 # define helper functions
-def tokenize_function(examples, tokenizer):
-    return tokenizer(examples["sentence"], truncation=True, padding="max_length")
+def tokenize_function_with_padding(examples, tokenizer):
+    return tokenizer(examples["sentence"], truncation=True, padding='max_length')
 
 
-def fine_tune_model(model_name, train_dataset, val_dataset, seed, device, num_epochs=DEFAULT_NUM_EPOCHS,
+def compute_metrics(eval_pred):
+    metric = load_metric("accuracy")
+    logits, labels = eval_pred
+    predictions = np.argmax(logits, axis=-1)
+    return metric.compute(predictions=predictions, references=labels)
+
+
+def fine_tune_model(model_name, train_dataset, val_dataset, seed, num_epochs=DEFAULT_NUM_EPOCHS,
                     batch_size=DEFAULT_BATCH_SIZE):
-    # Set random seed
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    # Set up tokenizer and model
-    model = AutoModelForSequenceClassification.from_pretrained(model_name, num_labels=2).to(device)
-    model.train()
+    model = AutoModelForSequenceClassification.from_pretrained(model_name, num_labels=2)
+    training_args = TrainingArguments(output_dir="test_trainer", evaluation_strategy="epoch",
+                                      seed=seed, num_train_epochs=num_epochs,
+                                      per_device_train_batch_size=batch_size,
+                                      per_device_eval_batch_size=batch_size)
 
-    # Set up optimizer and scheduler
-    optimizer = AdamW(model.parameters())
+    trainer = Trainer(
+        model,
+        training_args,
+        train_dataset=train_dataset,
+        eval_dataset=val_dataset,
+        compute_metrics=compute_metrics,
+    )
+    trainer.train()
 
-    num_training_steps = len(train_dataset) // (batch_size * num_epochs)
-    # lr_scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=0, num_training_steps=num_training_steps)
-
-    # Set up data loaders
-    train_sampler = RandomSampler(train_dataset)
-    train_dataloader = DataLoader(train_dataset, sampler=train_sampler, batch_size=batch_size)
-    val_sampler = SequentialSampler(val_dataset)
-    val_dataloader = DataLoader(val_dataset, sampler=val_sampler, batch_size=batch_size)
-
-    val_results = []
-    # Train model
-    # loop = tqdm(zip(val_loader, val_qas_ids_loader), leave=True)
-    for epoch in tqdm(range(num_epochs)):
-        for batch in tqdm(train_dataloader):
-            # move to device
-            inputs = {k: v.to(device) for k, v in batch.items()}
-
-            optimizer.zero_grad()
-            outputs = model(**inputs)
-
-            loss = outputs.loss
-            loss.backward()
-            optimizer.step()
-            # lr_scheduler.step()
-            # Log metrics to Weights&Biases
-            wandb.log({'train/loss': loss.item(), 'epoch': epoch, 'seed': seed})
-            # wandb.log({'train/learning_rate': lr_scheduler.get_last_lr()[0], 'epoch': epoch, 'seed': seed})
-            wandb.log({'train/batch_size': batch_size, 'epoch': epoch, 'seed': seed})
-
-        # Evaluate model
-        val_accuracy = evaluate_model(model, val_dataloader, epoch, seed, device)
-        val_results.append(val_accuracy)
-
-    # return the last validation accuracy
-    return val_results[-1]
+    # return model and the accuracy on the validation set
+    return trainer, trainer.evaluate()
 
 
-def evaluate_model(model, val_dataloader, epoch, seed, device):
-    model.eval()
-    val_accuracy = 0
-    val_loss = 0
-    for batch in val_dataloader:
-        with torch.no_grad():
-            inputs = {k: v.to(device) for k, v in batch.items()}
-            outputs = model(**inputs)
-            logits = outputs.logits
-            val_loss += outputs.loss
-            predictions = torch.argmax(logits, dim=-1)
-            val_accuracy += np.sum(predictions.cpu().numpy() == batch['labels'].cpu().numpy())
-
-    val_accuracy /= len(val_dataloader.dataset)  # divide by number of samples
-    val_accuracy *= 100  # convert to percentage
-
-    # Log metrics to Weights&Biases
-    wandb.log({'eval/accuracy': val_accuracy, 'epoch': epoch, 'seed': seed})
-    wandb.log({'eval/loss': val_loss, 'epoch': epoch, 'seed': seed})
-    return val_accuracy
-
-
-def summarize_results(results_df) -> pd.DataFrame:
+def summarize_results(results_metadata: list) -> pd.DataFrame:
     """
     Computes the mean and standard deviation of the model accuracies and formats them for saving to the res.txt file.
 
@@ -123,20 +81,25 @@ def summarize_results(results_df) -> pd.DataFrame:
     Returns:
         str: A formatted string containing the mean and standard deviation of the model accuracies.
     """
-    results = "RESULTS:\n"
     # Compute mean and standard deviation of each model's accuracy (across all seeds)
+    results_df = pd.DataFrame(results_metadata)
     results_df['mean'] = results_df.groupby('model_name')['accuracy'].transform('mean')
     results_df['std'] = results_df.groupby('model_name')['accuracy'].transform('std')
 
-    # Add mean and standard deviation to results df
-    # Format results
-    for model in results_df.to_dict('records'):
-        print(f"{model['model_name']}: {model['accuracy']:.3f} ± {model['std']:.3f}\n")
-        results += f"{model['model_name']}: {model['accuracy']:.3f}\n"
+    # Save the results to a file with name res.txt, with the following format:
+    # <model name>,<mean accuracy> +- <accuracy std>
+    models_results = []
+    for model in results_df.groupby('model_name').first().reset_index().to_dict('records'):
+        models_results.append(f"{model['model_name']},{model['mean']:.2f} +- {model['std']:.2f}")
+    with open('res.txt', 'w') as f:
+        f.write('\n'.join(models_results))
+    with open('res.txt', 'a') as f:
+        f.write('---\n')
+
     return results_df
 
 
-def predict(model, test_loader, device, output_path):
+def predict(test_dataset, best_model_metadata: dict, best_model_trainer: Trainer):
     """
     Generate predictions for the test set using the given model.
 
@@ -149,112 +112,165 @@ def predict(model, test_loader, device, output_path):
     Returns:
     - None
     """
-    model.eval()
-
-    predictions = []
-
-    with torch.no_grad():
-        for inputs, _ in tqdm(test_loader, desc='Predicting on test set'):
-            inputs = {key: val.to(device) for key, val in inputs.items()}
-
-            outputs = model(**inputs)[0]
-            _, preds = torch.max(outputs, dim=1)
-
-            predictions.extend(preds.cpu().numpy())
-
-    # Write the predictions to the output file
-    with open(output_path, 'w') as f:
-        for pred in predictions:
-            f.write(f"{pred}\n")
+    # Predict on test set with best model
+    tokenized_test_dataset = tokenize_test_dataset(test_dataset, best_model_metadata['model_name'])
+    # test_trainer = best_model['trainer']
+    # change the batch size of the trainer to 1
+    best_model_trainer.args.per_device_eval_batch_size = 1
+    # best_model_trainer.compute_loss = False
+    predict_start_time = time.time()
+    predictions = best_model_trainer.predict(tokenized_test_dataset)
+    predict_time = time.time() - predict_start_time
+    return predictions, predict_time
 
 
-def select_best_model(results_df: pd.DataFrame):
+def select_best_model(results: List[dict], batch_size: int) -> Tuple[dict, Trainer]:
+    # convert the results to a dataframe (with columns: model_name, seed, accuracy)
+    # remove the models from the results
+    results_metadata = [{key: val for key, val in result.items() if key != 'trainer'} for result in results]
+
+    # Compute mean and std of validation accuracy for each model
+    results_df = summarize_results(results_metadata)
+
     # select the best model (The model with the best mean, and if there are multiple models with the same mean, select the one with the best accuracy)
     # get all the rows with the best mean and select the one with the best accuracy
-    best_model = results_df.loc[results_df['mean'] == results_df['mean'].max()]
-    best_model = best_model.loc[best_model['accuracy'] == best_model['accuracy'].max()]
-    return best_model
+    best_models = results_df.loc[results_df['mean'] == results_df['mean'].max()]
+    best_models = best_models.loc[best_models['accuracy'] == best_models['accuracy'].max()]
+    best_model = best_models.iloc[0]  # get the first row
+    best_model_metadata = {'model_name': best_model['model_name'], 'seed': best_model['seed']}
+    best_model_trainer = get_best_trainer(best_model_metadata, results)
+    # get the trainer and the metadata of the best model
+    return best_model_metadata, best_model_trainer
 
 
-def save_results(summary_results, predictions):
-    pass
+def get_best_trainer(best_model_metadata: dict, results):
+    best_model = None
+    for result in results:
+        if result['model_name'] == best_model_metadata['model_name'] and result['seed'] == best_model_metadata['seed']:
+            best_model = result
+            break
+    if best_model is None:
+        raise Exception('No model was selected')
+    return best_model['trainer']
 
 
-def tokenize_data(train_dataset, val_dataset, test_dataset, model_name):
+def get_best_trainer_old(best_model_metadata: dict, batch_size: int):
+    model_name = best_model_metadata['model_name']
+    seed = best_model_metadata['seed']
+    run_name = f"{model_name}-seed-{seed}--batch_size-{batch_size}--wo-ls"
+    # load the trainer
+
+    model = AutoModelForSequenceClassification.from_pretrained(run_name)
+    trainer = Trainer(model_init=model)
+    return trainer
+
+
+def save_results(sentences, predictions):
+    # save the predictions to a file with the name predictions.txt
+    with open('predictions.txt', 'w') as f:
+        # save with the format of: "<input sentence>###<predicted label 0 or 1>"
+        for sentence, prediction_array in zip(sentences, predictions.predictions):
+            prediction_label = np.argmax(prediction_array, axis=-1)
+            f.write(f"{sentence}###{prediction_label}\n")
+
+
+def tokenize_data(train_dataset, val_dataset, model_name):
     tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
     train_dataset = train_dataset.map(
-        lambda examples: tokenize_function(examples, tokenizer), batched=True)
+        lambda examples: tokenize_function_with_padding(examples, tokenizer), batched=True,
+        load_from_cache_file=False)
     val_dataset = val_dataset.map(
-        lambda examples: tokenize_function(examples, tokenizer),
-        batched=True)
-    test_dataset = test_dataset.map(
-        lambda examples: tokenizer(examples["sentence"], truncation=True, max_length=tokenizer.model_max_length),
-        batched=True)
+        lambda examples: tokenize_function_with_padding(examples, tokenizer), batched=True,
+        load_from_cache_file=False)
+
     train_dataset.set_format(type='torch', columns=['input_ids', 'attention_mask', 'labels'])
     val_dataset.set_format(type='torch', columns=['input_ids', 'attention_mask', 'labels'])
+    train_dataset = train_dataset.remove_columns(['sentence', 'idx'])
+    val_dataset = val_dataset.remove_columns(['sentence', 'idx'])
+    return train_dataset, val_dataset
+
+
+def tokenize_test_dataset(test_dataset, model_name):
+    # change all the labels to 0
+    test_dataset = test_dataset.map(lambda examples: {'labels': 0})
+    tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
+    test_dataset = test_dataset.map(
+        lambda examples: tokenizer(examples["sentence"], truncation=True), load_from_cache_file=False)
     test_dataset.set_format(type='torch', columns=['input_ids', 'attention_mask', 'labels'])
-    return train_dataset, val_dataset, test_dataset
+    test_dataset = test_dataset.remove_columns(['sentence', 'idx'])
+    return test_dataset
 
 
-def main():
-    # Parse command line arguments
-    parser = argparse.ArgumentParser(description='Fine-tune large language models for sentiment analysis')
-    parser.add_argument('--num_seeds', type=int, help='number of seeds to use for each model', default=30)
-    parser.add_argument('--train_samples', type=int, help='number of samples to use for training or -1 for all',
-                        default=12)
-    parser.add_argument('--val_samples', type=int, help='number of samples to use for validation or -1 for all',
-                        default=12)
-    parser.add_argument('--test_samples', type=int, help='number of samples to predict or -1 for all',
-                        default=-1)
-    parser.add_argument('--batch_size', type=int, default=DEFAULT_BATCH_SIZE, help='batch size to use for training')
-    parser.add_argument('--epochs', type=int, default=DEFAULT_NUM_EPOCHS, help='number of epochs to train each model')
-    args = parser.parse_args()
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+def train_model(model_name, tokenized_train_dataset, tokenized_val_dataset, seed, num_epochs=DEFAULT_NUM_EPOCHS,
+                batch_size=DEFAULT_BATCH_SIZE):
+    run_name = f"{model_name}-seed-{seed}--batch_size-{batch_size}"
+    wandb.init(project='sentiment_analysis', entity='eliyahabba',
+               name=run_name, config={'model_name': model_name, 'seed': seed, 'batch_size': batch_size},
+               reinit=True)
 
-    # Set up Weights & Biases
-    # Set up Weights&Biases logging
-    # wandb.login()
+    trainer, val_accuracy_result = fine_tune_model(model_name=model_name,
+                                                   train_dataset=tokenized_train_dataset,
+                                                   val_dataset=tokenized_val_dataset,
+                                                   seed=seed, num_epochs=num_epochs,
+                                                   batch_size=batch_size)
+    result = {'model_name': model_name, 'seed': seed, 'accuracy': val_accuracy_result['eval_accuracy'],
+              'trainer': trainer}
+    wandb.finish()
+    # # save the model
+    # trainer.save_model(f"{run_name}")
+    # # torch.save(trainer.state, f"trainer_state_{run_name}-model.pt")  # Save the Trainer's state
+    return result
+
+
+def train_model_on_many_seeds(model_name, train_dataset, val_dataset, seeds, num_epochs=DEFAULT_NUM_EPOCHS,
+                              batch_size=DEFAULT_BATCH_SIZE):
+    tokenized_train_dataset, tokenized_val_dataset = tokenize_data(train_dataset, val_dataset, model_name)
+    model_results = []
+    for seed in seeds:
+        transformers.set_seed(seed)
+        result = train_model(model_name, tokenized_train_dataset, tokenized_val_dataset, seed, num_epochs, batch_size)
+        model_results.append(result)
+    return model_results
+
+
+def main(args):
     # Load SST-2 dataset
     train_dataset, val_dataset, test_dataset = get_data(args.train_samples, args.val_samples, args.test_samples)
 
     # Fine-tune each model with several seeds and compute mean and std of validation accuracy
     seeds = list(range(args.num_seeds))
     results = []
+    start_train_time = time.time()
     for model_name in MODEL_NAMES:
         # load the tokenizer and tokenize the data
-
-        tokenized_train_dataset, tokenized_val_dataset, tokenized_test_dataset = tokenize_data(train_dataset,
-                                                                                               val_dataset,
-                                                                                               test_dataset,
-                                                                                               model_name)
-
-        for seed in seeds:
-            run_name = f"{model_name}-seed-{seed}--batch_size-{args.batch_size}--wo-ls"
-            wandb.init(project='sentiment_analysis', entity='eliyahabba',
-                       name=run_name, config={'model_name': model_name, 'seed': seed, 'batch_size': args.batch_size},
-                       reinit=True)
-
-            val_accuracy_result = fine_tune_model(model_name=model_name,
-                                                  train_dataset=tokenized_train_dataset,
-                                                  val_dataset=tokenized_val_dataset,
-                                                  seed=seed, device=device, num_epochs=args.epochs,
-                                                  batch_size=args.batch_size)
-            result = {'model_name': model_name, 'seed': seed, 'accuracy': val_accuracy_result}
-            results.append(result)
-    results_df = pd.DataFrame(results)
-    # Compute mean and std of validation accuracy for each model
-    summary_results = summarize_results(results_df)
-
+        results.extend(train_model_on_many_seeds(model_name, train_dataset, val_dataset, seeds, args.epochs,
+                                                 args.batch_size))
+    end_train_time = time.time()
     # Select best model
-    best_model = select_best_model(summary_results)
-
+    best_model_metadata, best_model_trainer = select_best_model(results, args.batch_size)
     # Predict on test set with best model
-    # _ = fine_tune_model(best_model_name, train_dataset, val_dataset, best_seed)
-    # predictions = predict(model, tokenized_test_dataset, tokenizer, device, 'test_predictions.txt')
+    predict_start_time = time.time()
+    predictions, predict_time = predict(test_dataset, best_model_metadata, best_model_trainer)
+    predict_end_time = time.time()
 
+    with open('res.txt', 'a') as f:
+        f.write(f"train time,{(end_train_time - start_train_time):.2f}\n")
+        f.write(f"predict time,{(predict_end_time - predict_start_time):.2f}\n")
     # Save results to files
-    # save_results(summary_results, predictions)
+    save_results(test_dataset['sentence'], predictions)
 
 
 if __name__ == '__main__':
-    main()
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description='Fine-tune large language models for sentiment analysis')
+    parser.add_argument('num_seeds', type=int, help='number of seeds to use for each model', default=3)
+    parser.add_argument('train_samples', type=int, help='number of samples to use for training or -1 for all',
+                        default=-1)
+    parser.add_argument('val_samples', type=int, help='number of samples to use for validation or -1 for all',
+                        default=-1)
+    parser.add_argument('test_samples', type=int, help='number of samples to predict or -1 for all',
+                        default=-1)
+    parser.add_argument('batch_size', type=int, default=DEFAULT_BATCH_SIZE, help='batch size to use for training')
+    parser.add_argument('epochs', type=int, default=DEFAULT_NUM_EPOCHS, help='number of epochs to train each model')
+    args = parser.parse_args()
+    main(args)
