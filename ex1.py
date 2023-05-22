@@ -90,7 +90,7 @@ def summarize_results(results_metadata: list) -> pd.DataFrame:
     # <model name>,<mean accuracy> +- <accuracy std>
     models_results = []
     for model in results_df.groupby('model_name').first().reset_index().to_dict('records'):
-        models_results.append(f"{model['model_name']},{model['mean']:.2f} +- {model['std']:.2f}")
+        models_results.append(f"{model['model_name']},{model['mean']:.6f} +- {model['std']:.6f}")
     with open('res.txt', 'w') as f:
         f.write('\n'.join(models_results))
     with open('res.txt', 'a') as f:
@@ -233,7 +233,7 @@ def train_model_on_many_seeds(model_name, train_dataset, val_dataset, seeds, num
     model_results = []
     for seed in seeds:
         transformers.set_seed(seed)
-        result = train_model(model_name, tokenized_train_dataset, tokenized_val_dataset, seed, num_epochs, batch_size)
+        result = train_model(model_name, tokenized_train_dataset, tokenized_val_dataset, seed, num_epochs, batch_size, use_wandb)
         model_results.append(result)
     return model_results
 
@@ -259,8 +259,8 @@ def main(args):
     predict_end_time = time.time()
 
     with open('res.txt', 'a') as f:
-        f.write(f"train time,{(end_train_time - start_train_time):.2f}\n")
-        f.write(f"predict time,{(predict_end_time - predict_start_time):.2f}\n")
+        f.write(f"train time,{(end_train_time - start_train_time):.5f}\n")
+        f.write(f"predict time,{(predict_end_time - predict_start_time):.5f}\n")
     # Save results to files
     save_results(test_dataset['sentence'], predictions)
 
