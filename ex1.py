@@ -1,7 +1,6 @@
 import argparse
 import time
 from typing import List, Tuple
-
 import numpy as np
 import pandas as pd
 import transformers
@@ -94,7 +93,7 @@ def summarize_results(results_metadata: list) -> pd.DataFrame:
     with open('res.txt', 'w') as f:
         f.write('\n'.join(models_results))
     with open('res.txt', 'a') as f:
-        f.write('---\n')
+        f.write('\n---\n')
 
     return results_df
 
@@ -233,7 +232,8 @@ def train_model_on_many_seeds(model_name, train_dataset, val_dataset, seeds, num
     model_results = []
     for seed in seeds:
         transformers.set_seed(seed)
-        result = train_model(model_name, tokenized_train_dataset, tokenized_val_dataset, seed, num_epochs, batch_size, use_wandb)
+        result = train_model(model_name, tokenized_train_dataset, tokenized_val_dataset, seed, num_epochs, batch_size,
+                             use_wandb)
         model_results.append(result)
     return model_results
 
